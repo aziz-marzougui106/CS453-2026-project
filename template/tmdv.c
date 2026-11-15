@@ -123,12 +123,156 @@ void tm_destroy(shared_t shared){
     free(shr);
 
 }
-void*    tm_start(shared_t);
-size_t   tm_size(shared_t);
-size_t   tm_align(shared_t);
-tx_t     tm_begin(shared_t, bool);
-bool     tm_end(shared_t, tx_t);
-bool     tm_read(shared_t, tx_t, void const*, size_t, void*);
-bool     tm_write(shared_t, tx_t, void const*, size_t, void*);
-alloc_t  tm_alloc(shared_t, tx_t, size_t, void**);
-bool     tm_free(shared_t, tx_t, void*);
+/** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
+ * @param shared Shared memory region to query
+ * @return Start address of the first allocated segment
+**/
+void* tm_start(shared_t shared){
+    //(void)shared;
+    return (void*)((uintptr_t)1 << OFFSET_BITS);
+}
+size_t tm_size(shared_t shared){
+    if(!shared) return NULL;
+    return ((struct shared_region*)shared)->size;
+}
+size_t tm_align(shared_t shared ){
+    if(!shared) return NULL;
+    return ((struct shared_region*)shared)->align;
+}
+/** [thread-safe] Begin a new transaction on the given shared memory region.
+ * @param shared Shared memory region to start a transaction on
+ * @param is_ro  Whether the transaction is read-only
+ * @return Opaque transaction ID, 'invalid_tx' on failure
+**/
+tx_t tm_begin(shared_t shared, bool is_ro) {
+    struct shared_region* shr = (struct shared_region*)shared;
+
+    struct transaction* trx = calloc(1, sizeof(struct transaction));
+    if (!trx) return invalid_tx;
+    trx->is_ro = is_ro;
+
+    // Read-only transactions never write, alloc or free: skip the lists.
+    if (!is_ro) {
+        trx->alloc_set = (id_list){calloc(initial_capcity, sizeof(uint32_t)), 0, initial_capcity};
+        if (!trx->alloc_set.ids) goto fail_trx;
+        trx->free_set = (id_list){calloc(initial_capcity, sizeof(uint32_t)), 0, initial_capcity};
+        if (!trx->free_set.ids) goto fail_alloc;
+        trx->written = (word_list){calloc(initial_capcity, sizeof(ctrl_t*)), 0, initial_capcity};
+        if (!trx->written.words) goto fail_free;
+    }
+
+    // Batcher enter (handout pseudocode), under the lock
+    pthread_mutex_lock(&shr->lock);
+    if (shr->remaining == 0) {
+        shr->remaining = 1;
+    } else {
+        shr->blocked++;
+        uint32_t my_epoch = shr->epoch;
+        while (shr->epoch == my_epoch)          // wait for the next batch
+            pthread_cond_wait(&shr->cond, &shr->lock);
+    }
+    trx->epoch = shr->epoch;
+    trx->id    = shr->next_tx_id++;             // plain ++, we hold the lock
+    pthread_mutex_unlock(&shr->lock);
+
+    return (tx_t)trx;
+
+fail_free:  free(trx->free_set.ids);
+fail_alloc: free(trx->alloc_set.ids);
+fail_trx:   free(trx);
+    return invalid_tx;
+}
+// ---- small helpers (append with growth) ----
+static bool words_append(word_list* dst, ctrl_t** src, size_t n) {
+    if (dst->count + n > dst->cap) {
+        size_t ncap = dst->cap ? dst->cap : initial_capcity;
+        while (ncap < dst->count + n) ncap *= 2;
+        ctrl_t** p = realloc(dst->words, ncap * sizeof(ctrl_t*));
+        if (!p) return false;
+        dst->words = p; dst->cap = ncap;
+    }
+    memcpy(dst->words + dst->count, src, n * sizeof(ctrl_t*));
+    dst->count += n;
+    return true;
+}
+static bool ids_append(id_list* dst, uint32_t const* src, size_t n) {
+    if (dst->count + n > dst->cap) {
+        size_t ncap = dst->cap ? dst->cap : initial_capcity;
+        while (ncap < dst->count + n) ncap *= 2;
+        uint32_t* p = realloc(dst->ids, ncap * sizeof(uint32_t));
+        if (!p) return false;
+        dst->ids = p; dst->cap = ncap;
+    }
+    memcpy(dst->ids + dst->count, src, n * sizeof(uint32_t));
+    dst->count += n;
+    return true;
+}
+
+// ---- epoch end: caller holds shr->lock and is the last one of the batch ----
+static void apply_epoch_end(struct shared_region* shr) {
+    // 1. publish: flip readable bit, clear written bit (flips BEFORE frees)
+    for (size_t i = 0; i < shr->pending_written.count; i++) {
+        ctrl_t* p = shr->pending_written.words[i];
+        ctrl_t c = *p;                       // nobody else is running: plain access
+        assert(c & WRITTEN_BIT);             // catches duplicates
+        c ^= READABLE_BIT;
+        c &= ~WRITTEN_BIT;
+        *p = c;
+    }
+    shr->pending_written.count = 0;
+
+    // 2. release freed segments and recycle their ids
+    for (size_t i = 0; i < shr->pending_free.count; i++) {
+        uint32_t id = shr->pending_free.ids[i];
+        segment* seg = atomic_load(&shr->segs[id]);
+        free(seg->words);
+        free(seg);
+        atomic_store(&shr->segs[id], NULL);
+        ids_append(&shr->free_ids, &id, 1);  // if this fails the id is just lost
+    }
+    shr->pending_free.count = 0;
+
+    // 3. next epoch
+    shr->epoch++;
+    shr->next_tx_id = 1;
+}
+
+// ---- leave: used by tm_end AND by every abort path ----
+static void leave_batch(struct shared_region* shr) {
+    shr->remaining--;
+    if (shr->remaining == 0) {
+        apply_epoch_end(shr);
+        shr->remaining = shr->blocked;
+        shr->blocked = 0;
+        pthread_cond_broadcast(&shr->cond);
+    }
+}
+/** [thread-safe] End the given transaction.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to end
+ * @return Whether the whole transaction committed
+**/
+bool tm_end(shared_t shared, tx_t tx){
+    struct transaction* trx = (struct transaction*)tx;
+    struct shared_region* shr = (struct shared_region*)shared;
+
+    pthread_mutex_lock(&shr->lock);
+    if (!trx->is_ro) {
+        // hand over committed work BEFORE decrementing, in the same lock hold
+        words_append(&shr->pending_written, trx->written.words, trx->written.count);
+        ids_append(&shr->pending_free, trx->free_set.ids, trx->free_set.count);
+        // alloc_set is NOT undone: those segments are now permanent
+    }
+    leave_batch(shr);
+    pthread_mutex_unlock(&shr->lock);
+
+    free(trx->written.words);
+    free(trx->alloc_set.ids);
+    free(trx->free_set.ids);
+    free(trx);
+    return true;
+}
+bool tm_read(shared_t, tx_t, void const*, size_t, void*);
+bool tm_write(shared_t, tx_t, void const*, size_t, void*);
+alloc_t tm_alloc(shared_t, tx_t, size_t, void**);
+bool tm_free(shared_t, tx_t, void*);
