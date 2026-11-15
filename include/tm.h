@@ -45,6 +45,7 @@ typedef int alloc_t;
 static alloc_t const success_alloc = 0; // Allocation successful and the TX can continue
 static alloc_t const abort_alloc   = 1; // TX was aborted and could be retried
 static alloc_t const nomem_alloc   = 2; // Memory allocation failed but TX was not aborted
+static size_t const initial_capcity=4;
 
 // -------------------------------------------------------------------------- //
 
