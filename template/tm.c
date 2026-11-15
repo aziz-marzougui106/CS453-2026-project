@@ -107,7 +107,7 @@ shared_t tm_create(size_t size, size_t align) {
     shr->size=size;shr->align=align;
     shr->next_id=1;
     //shr->start_addr = aligned_alloc(align,size);if(!shr->start_addr) return invalid_shared;
-    return(shared_t*)shr;
+    return(shared_t)shr;
 }
 
 /** Destroy (i.e. clean-up + free) a given shared memory region.
@@ -194,12 +194,24 @@ bool tm_end(shared_t shared, tx_t tx) {
 **/
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    
+    if(size==0)return true;
+    struct transaction* trx= (struct transaction*) tx;
+    struct shared_region* shr = (struct shared_region*) shared;
+    size_t current_size=0;
+    while(current_size < size){
+        void* w= source+current_size;
+        current_size+=shr->align;
+        if (in_write_set(trx,w)){
+
+        }
+    }
     
 
     return false;
 }
-
+bool in_write_set(struct transaction* trx,void const* w){
+    return true;
+}
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
