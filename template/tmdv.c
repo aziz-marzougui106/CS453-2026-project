@@ -272,7 +272,153 @@ bool tm_end(shared_t shared, tx_t tx){
     free(trx);
     return true;
 }
-bool tm_read(shared_t, tx_t, void const*, size_t, void*);
-bool tm_write(shared_t, tx_t, void const*, size_t, void*);
-alloc_t tm_alloc(shared_t, tx_t, size_t, void**);
-bool tm_free(shared_t, tx_t, void*);
+/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param source Source start address (in the shared region)
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
+ * @param target Target start address (in a private region)
+ * @return Whether the whole transaction can continue
+**/
+bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
+    struct shared_region* shr = (struct shared_region*)shared;
+    struct transaction* trx = (struct transaction*)tx;
+    size_t max_step = size / shr->align;
+
+    // decode ONCE (source is a name, never dereference it)
+    uintptr_t addr = (uintptr_t)source;
+    size_t seg_id  = addr >> OFFSET_BITS;
+    size_t first   = (addr & OFFSET_MASK) / shr->align;
+    segment* seg   = atomic_load(&shr->segs[seg_id]);
+
+    char* copy_target = target;
+    for (size_t i = 0; i < max_step; i++) {
+        char* word = seg->words + (first + i) * shr->stride;
+        _Atomic ctrl_t* ctrl = (_Atomic ctrl_t*)word;
+        char* copyA = word + shr->header;
+        char* copyB = copyA + shr->align;
+        char* to_read;
+
+        if (trx->is_ro) {
+            ctrl_t h = atomic_load(ctrl);
+            to_read = (h & READABLE_BIT) ? copyB : copyA;
+        } else {
+            ctrl_t h = atomic_load(ctrl);
+            while (true) {
+                bool fresh = ((h >> TAG_SHIFT) & 0xFFFFFFFFu) != trx->epoch;
+                uint64_t acc = fresh?0:(h >> ACC_SHIFT);
+
+                if (!fresh && (h & WRITTEN_BIT)) {
+                    if (acc != trx->id) { tx_abort(shr, trx); return false; }
+                    // my own write: the writable copy
+                    to_read = (h & READABLE_BIT) ? copyA : copyB;
+                    break;
+                }
+                // not written: read the committed copy, register as accessor
+                uint64_t newacc = (acc == 0) ? trx->id
+                                :(acc == trx->id || acc == MULTI)?acc:MULTI;
+                if (!fresh && newacc == acc) {           // nothing to update
+                    to_read = (h & READABLE_BIT) ? copyB : copyA;
+                    break;
+                }
+                ctrl_t n = (h & READABLE_BIT)
+                         | ((ctrl_t)trx->epoch << TAG_SHIFT)
+                         | ((ctrl_t)newacc << ACC_SHIFT);
+                if (atomic_compare_exchange_weak(ctrl, &h, n)) {   // h reloaded on failure
+                    to_read = (n & READABLE_BIT) ? copyB : copyA;
+                    break;
+                }
+            }
+        }
+        memcpy(copy_target,to_read,shr->align);
+        copy_target+=shr->align;
+    }
+    return true;
+}
+void tx_abort(shared_t shared,tx_t tx){
+    struct shared_region* shr = (struct shared_region*)shared;
+    struct transaction* trx = (struct transaction*)tx;
+}
+
+/** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param source Source start address (in a private region)
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
+ * @param target Target start address (in the shared region)
+ * @return Whether the whole transaction can continue
+**/
+bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
+    struct shared_region* shr = (struct shared_region*)shared;
+    struct transaction* trx = (struct transaction*)tx;
+
+    // decode ONCE (target is a name, never dereference it)
+    uintptr_t addr = (uintptr_t)target;
+    size_t seg_id  = addr >> OFFSET_BITS;
+    size_t first   = (addr & OFFSET_MASK) / shr->align;
+    segment* seg   = atomic_load(&shr->segs[seg_id]);
+
+    char const* src = source;
+    size_t max_step = size / shr->align;
+
+    for (size_t i = 0; i < max_step; ++i) {
+        char* word = seg->words + (first + i) * shr->stride;
+        _Atomic ctrl_t* ctrl = (_Atomic ctrl_t*)word;
+        char* copyA = word + shr->header;
+        char* copyB = copyA + shr->align;
+        char* to_write;                       // destination: the writable copy
+
+        ctrl_t h = atomic_load(ctrl);
+        while (true) {
+            bool     fresh = ((h >> TAG_SHIFT) & 0xFFFFFFFFu) != trx->epoch;
+            uint64_t acc   = fresh ? 0 : (h >> ACC_SHIFT);
+            bool     written = !fresh && (h & WRITTEN_BIT);
+
+            if (written) {
+                if (acc != trx->id) { tx_abort(shr, trx); return false; }
+                to_write = (h & READABLE_BIT) ? copyA : copyB;   // my own write
+                break;
+            }
+            if (acc != 0 && acc != trx->id) {                    // someone else accessed it
+                tx_abort(shr, trx); return false;
+            }
+            ctrl_t n = (h & READABLE_BIT)
+                     | ((ctrl_t)trx->epoch << TAG_SHIFT)
+                     | ((ctrl_t)trx->id << ACC_SHIFT)
+                     | WRITTEN_BIT;
+            if (atomic_compare_exchange_weak(ctrl, &h, n)) {     // h reloaded on failure
+                to_write = (n & READABLE_BIT) ? copyA : copyB;
+                // push only after the CAS that made the word written
+                if (!words_append(&trx->written, (ctrl_t**)&ctrl, 1)) {
+                    tx_abort(shr, trx); return false;
+                }
+                break;
+            }
+        }
+        memcpy(to_write, src, shr->align);
+        src += shr->align;
+    }
+    return true;
+}
+/** [thread-safe] Memory allocation in the given transaction.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param size   Allocation requested size (in bytes), must be a positive multiple of the alignment
+ * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
+ * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
+**/
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target){
+    struct shared_region* shr = (struct shared_region*)shared;
+    struct transaction* trx = (struct transaction*)tx;
+}
+/** [thread-safe] Memory freeing in the given transaction.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param target Address of the first byte of the previously allocated segment to deallocate
+ * @return Whether the whole transaction can continue
+**/
+bool tm_free(shared_t shared, tx_t tx, void*target){
+    struct shared_region* shr = (struct shared_region*)shared;
+    struct transaction* trx = (struct transaction*)tx;
+    return true;
+}
