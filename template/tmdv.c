@@ -72,7 +72,11 @@ struct transaction {
     id_list   alloc_set;       // segments created by this tx (destroy on abort)
     id_list   free_set;        // segments to release if committed
 };
-
+/** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
+ * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
+ * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
+ * @return Opaque shared memory region handle, 'invalid_shared' on failure
+**/
 shared_t tm_create(size_t size, size_t align){
     // align must be a power of two, size a positive multiple of it
     if (align == 0 || (align & (align - 1)) != 0) return invalid_shared;
@@ -108,6 +112,9 @@ shared_t tm_create(size_t size, size_t align){
     fail_region:free(shr);
     return invalid_shared;
 }
+/** Destroy (i.e. clean-up + free) a given shared memory region.
+ * @param shared Shared memory region to destroy, with no running transaction
+**/
 void tm_destroy(shared_t shared){
     struct shared_region* shr=(struct shared_region*)shared;
     for (uint32_t id=1;id<shr->next_seg_id;id++){
@@ -167,7 +174,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         shr->remaining = 1;
     } else {
         shr->blocked++;
-        uint32_t my_epoch = shr->epoch;
+        uint32_t my_epoch = shr->epoch;//epoch of prev. batch
         while (shr->epoch == my_epoch)          // wait for the next batch
             pthread_cond_wait(&shr->cond, &shr->lock);
     }
@@ -335,9 +342,35 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     }
     return true;
 }
+
 void tx_abort(shared_t shared,tx_t tx){
     struct shared_region* shr = (struct shared_region*)shared;
     struct transaction* trx = (struct transaction*)tx;
+    for (size_t i=0;i<trx->written.count;++i) {
+        _Atomic ctrl_t* ctrl = (_Atomic ctrl_t*)trx->written.words[i];
+        ctrl_t h = atomic_load(ctrl);
+        atomic_store(ctrl, h & READABLE_BIT);     // untouched: tag 0, no acc, not written . epoch is squashed intentionally as leave batch is about to be called
+    }
+    for (size_t i = 0; i < trx->alloc_set.count; ++i) {
+        uint32_t id = trx->alloc_set.ids[i];
+        segment* seg = atomic_load(&shr->segs[id]);
+        free(seg->words);
+        free(seg);
+        atomic_store(&shr->segs[id], NULL);
+    }
+
+    // 3. free_set is simply dropped (freed with the lists below)
+
+    pthread_mutex_lock(&shr->lock);
+    // give the ids back (under the lock, as free_ids is protected by it)
+    ids_append(&shr->free_ids, trx->alloc_set.ids, trx->alloc_set.count);
+    leave_batch(shr);
+    pthread_mutex_unlock(&shr->lock);
+
+    free(trx->written.words);
+    free(trx->alloc_set.ids);
+    free(trx->free_set.ids);
+    free(trx);
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -407,9 +440,49 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target){
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
     struct shared_region* shr = (struct shared_region*)shared;
     struct transaction* trx = (struct transaction*)tx;
+    size_t nb_words = size / shr->align;
+
+    // 1. take an id, under the lock
+    uint32_t my_id;
+    pthread_mutex_lock(&shr->lock);
+    if (shr->free_ids.count > 0) {
+        my_id = shr->free_ids.ids[--shr->free_ids.count];
+    } else if (shr->next_seg_id < MAX_SEGMENTS) {
+        my_id = shr->next_seg_id++;
+    } else {
+        pthread_mutex_unlock(&shr->lock);
+        tx_abort(shr, trx);                 // frees trx, never touch it afterwards
+        return abort_alloc;
+    }
+    pthread_mutex_unlock(&shr->lock);
+
+    // 2. build the segment (zeroed memory = valid initial state)
+    segment* sg = malloc(sizeof(segment));
+    if (!sg) goto give_back;
+    if (nb_words > SIZE_MAX / shr->stride) { free(sg); goto give_back; }
+    sg->words = calloc(nb_words, shr->stride);
+    if (!sg->words) { free(sg); goto give_back; }
+    sg->nwords = nb_words;
+
+    // 3. remember it for abort; on failure undo everything
+    if (!ids_append(&trx->alloc_set, &my_id, 1)) {
+        free(sg->words); free(sg);
+        goto give_back;
+    }
+
+    // 4. publish and return the encoded name
+    atomic_store(&shr->segs[my_id], sg);
+    *target = (void*)((uintptr_t)my_id << OFFSET_BITS);
+    return success_alloc;
+
+    give_back:
+    pthread_mutex_lock(&shr->lock);
+    ids_append(&shr->free_ids, &my_id, 1);
+    pthread_mutex_unlock(&shr->lock);
+    return nomem_alloc;
 }
 /** [thread-safe] Memory freeing in the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -420,5 +493,10 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target){
 bool tm_free(shared_t shared, tx_t tx, void*target){
     struct shared_region* shr = (struct shared_region*)shared;
     struct transaction* trx = (struct transaction*)tx;
+    uint32_t seg_id = (uint32_t)((uintptr_t)target >> OFFSET_BITS);   // offset part is 0
+    if (!ids_append(&trx->free_set, &seg_id, 1)) {
+        tx_abort(shr, trx);
+        return false;
+    }
     return true;
 }
